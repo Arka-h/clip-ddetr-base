@@ -24,14 +24,17 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch import Tensor
-
-# needed due to empty tensor bug in pytorch and torchvision 0.5
 import torchvision
-if float(torchvision.__version__[:3]) < 0.5:
+from distutils.version import LooseVersion
+
+tv = LooseVersion(torchvision.__version__)
+
+if tv < LooseVersion("0.5"):
+    # original very-old case
     import math
     from torchvision.ops.misc import _NewEmptyTensorOp
+
     def _check_size_scale_factor(dim, size, scale_factor):
-        # type: (int, Optional[List[int]], Optional[float]) -> None
         if size is None and scale_factor is None:
             raise ValueError("either size or scale_factor should be defined")
         if size is not None and scale_factor is not None:
@@ -41,23 +44,45 @@ if float(torchvision.__version__[:3]) < 0.5:
                 "scale_factor shape must match input shape. "
                 "Input is {}D, scale_factor size is {}".format(dim, len(scale_factor))
             )
+
     def _output_size(dim, input, size, scale_factor):
-        # type: (int, Tensor, Optional[List[int]], Optional[float]) -> List[int]
         assert dim == 2
         _check_size_scale_factor(dim, size, scale_factor)
         if size is not None:
             return size
-        # if dim is not 2 or scale_factor is iterable use _ntuple instead of concat
         assert scale_factor is not None and isinstance(scale_factor, (int, float))
         scale_factors = [scale_factor, scale_factor]
-        # math.floor might return float in py2.7
         return [
             int(math.floor(input.size(i + 2) * scale_factors[i])) for i in range(dim)
         ]
-elif float(torchvision.__version__[:3]) < 0.7:
+
+elif tv < LooseVersion("0.7"):
+    # slightly newer torchvision still had these
     from torchvision.ops import _new_empty_tensor
     from torchvision.ops.misc import _output_size
 
+else:
+    # modern torchvision: these internals moved / aren't public
+    # we just define minimal versions used by DETR
+    def _output_size(dim, input, size, scale_factor):
+        if size is not None and scale_factor is not None:
+            raise ValueError("only one of size or scale_factor should be defined")
+        if size is not None:
+            return size
+        # assume 2D upsample like the original code
+        assert scale_factor is not None
+        if isinstance(scale_factor, (list, tuple)):
+            return [
+                int(input.size(i + 2) * scale_factor[i]) for i in range(dim)
+            ]
+        else:
+            return [
+                int(input.size(i + 2) * scale_factor) for i in range(dim)
+            ]
+
+    def _new_empty_tensor(x, shape):
+        # x is a tensor; return an empty tensor on same device/dtype
+        return x.new_empty(shape)
 
 class SmoothedValue(object):
     """Track a series of values and provide access to smoothed values over a

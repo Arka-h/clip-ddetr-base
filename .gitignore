@@ -1,0 +1,7 @@
+.env
+annotations/
+checkpoints/
+outputs/
+__pycache__/
+models/ops/build/
+*.ipynb
