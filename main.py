@@ -25,6 +25,7 @@ import datasets.samplers as samplers
 from datasets import build_dataset, get_coco_api_from_dataset
 from engine import evaluate, train_one_epoch
 from models import build_model
+import wandb
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Deformable DETR Detector', add_help=False)
@@ -151,9 +152,6 @@ def main(args):
     model, criterion, postprocessors = build_model(args)
     model.to(device)
     
-    if args.wandb and utils.is_main_process():
-        wandb.watch(model, log='gradients', log_freq=1000)  # can be heavy
-    
     output_dir = Path(args.output_dir) if args.output_dir else None
     
     if args.resume and os.path.isfile(args.resume) and (not args.output_dir):
@@ -171,7 +169,6 @@ def main(args):
     
     # initialize wandb
     if args.wandb and utils.is_main_process():
-        import wandb
         wandb.init(project=args.wandb_project, 
                     name=args.wandb_name, 
                     entity=args.wandb_user, 
@@ -181,7 +178,7 @@ def main(args):
         wandb.config.update({"git_sha": git_sha}, allow_val_change=True)
         if args.output_dir and ((Path(args.output_dir) / "wandb_run_id.txt").exists() is False):
             (Path(args.output_dir) / "wandb_run_id.txt").write_text(wandb.run.id)
-    
+        wandb.watch(model, log='gradients', log_freq=1000)  # can be heavy
     model_without_ddp = model
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if args.wandb and utils.is_main_process():
@@ -307,7 +304,7 @@ def main(args):
             utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
         
         if args.wandb and utils.is_main_process():
-            import wandb
+            
             # optional: log once for eval-only runs
             wandb.log({f"val/{k}": v for k, v in test_stats.items()}, step=0)
             wandb.finish()
@@ -323,7 +320,7 @@ def main(args):
         lr_scheduler.step()
         # WandB per-epoch logging
         if args.wandb and utils.is_main_process():
-            import wandb
+            
             metrics = {f"train/{k}": v for k, v in train_stats.items()}
             for i, pg in enumerate(optimizer.param_groups):
                 metrics[f"lr/group_{i}"] = pg["lr"]
@@ -345,7 +342,7 @@ def main(args):
                 }, checkpoint_path)
                 # upload symlinks/ckpts to wandb
                 if args.wandb and utils.is_main_process():
-                    import wandb
+                    
                     wandb.save(str(checkpoint_path), base_path=str(output_dir))
         
         test_stats, coco_evaluator = evaluate(
@@ -353,7 +350,7 @@ def main(args):
         )
         # wandb validation metrics
         if args.wandb and utils.is_main_process():
-            import wandb
+            
             # (re)build the dict to avoid scope surprises
             all_metrics = {f"train/{k}": v for k, v in train_stats.items()}
             all_metrics.update({f"val/{k}": v for k, v in test_stats.items()})
@@ -385,7 +382,7 @@ def main(args):
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
     if args.wandb and utils.is_main_process():
-        import wandb
+        
         wandb.finish()
 
 if __name__ == '__main__':
