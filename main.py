@@ -11,6 +11,7 @@
 import argparse
 import datetime
 import json
+import os
 import random
 import time
 from pathlib import Path
@@ -121,13 +122,19 @@ def get_args_parser():
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--num_workers', default=2, type=int)
     parser.add_argument('--cache_mode', default=False, action='store_true', help='whether to cache images on memory')
-
+    
+    # * WandB
+    parser.add_argument('--wandb', action='store_true', default=False, help='If logging to be done in wandb!!')
+    parser.add_argument('--wandb_user', default='', help='Username for wandb logging.')
+    parser.add_argument('--wandb_project', default='clip-ddetr-test', help='Project name for wandb logging.')
+    parser.add_argument('--wandb_name', default='clip_ddetr_coco', help='job name to track on wandb')
     return parser
 
 
 def main(args):
     utils.init_distributed_mode(args)
-    print("git:\n  {}\n".format(utils.get_sha()))
+    git_sha = utils.get_sha()
+    print(f"git:\n  {git_sha}\n")
 
     if args.frozen_weights is not None:
         assert args.masks, "Frozen training is meant for segmentation only"
@@ -143,9 +150,42 @@ def main(args):
 
     model, criterion, postprocessors = build_model(args)
     model.to(device)
-
+    
+    if args.wandb and utils.is_main_process():
+        wandb.watch(model, log='gradients', log_freq=1000)  # can be heavy
+    
+    output_dir = Path(args.output_dir) if args.output_dir else None
+    
+    if args.resume and os.path.isfile(args.resume) and (not args.output_dir):
+        args.output_dir = str(Path(args.resume).parent) # Set the output dir to be same as resume checkpoint dir
+    if args.wandb and utils.is_main_process() and args.output_dir:
+        os.environ.setdefault("WANDB_DIR", str(Path(args.output_dir)))
+    wandb_id, wandb_resume_flag = None, None
+    if args.wandb and utils.is_main_process() and args.resume and os.path.isfile(args.resume) :
+        resume_dir = Path(args.resume).parent
+        rid_file = resume_dir / "wandb_run_id.txt"
+        if rid_file.is_file():
+            wandb_id = rid_file.read_text().strip()
+            wandb_resume_flag = "must"
+            print(f"Resuming wandb run from id: {wandb_id}")
+    
+    # initialize wandb
+    if args.wandb and utils.is_main_process():
+        import wandb
+        wandb.init(project=args.wandb_project, 
+                    name=args.wandb_name, 
+                    entity=args.wandb_user, 
+                    config=vars(args),
+                    id=wandb_id,
+                    resume=wandb_resume_flag or "never")
+        wandb.config.update({"git_sha": git_sha}, allow_val_change=True)
+        if args.output_dir and ((Path(args.output_dir) / "wandb_run_id.txt").exists() is False):
+            (Path(args.output_dir) / "wandb_run_id.txt").write_text(wandb.run.id)
+    
     model_without_ddp = model
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if args.wandb and utils.is_main_process():
+        wandb.summary["n_parameters"] = n_parameters
     print('number of params:', n_parameters)
 
     dataset_train = build_dataset(image_set='train', args=args)
@@ -254,17 +294,23 @@ def main(args):
                 lr_scheduler.base_lrs = list(map(lambda group: group['initial_lr'], optimizer.param_groups))
             lr_scheduler.step(lr_scheduler.last_epoch)
             args.start_epoch = checkpoint['epoch'] + 1
-        # check the resumed model
-        if not args.eval:
-            test_stats, coco_evaluator = evaluate(
-                model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
-            )
+        # check the resumed model: Too expensive
+        # if not args.eval:
+        #     test_stats, coco_evaluator = evaluate(
+        #         model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
+        #     )
     
     if args.eval:
         test_stats, coco_evaluator = evaluate(model, criterion, postprocessors,
                                               data_loader_val, base_ds, device, args.output_dir)
         if args.output_dir:
             utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
+        
+        if args.wandb and utils.is_main_process():
+            import wandb
+            # optional: log once for eval-only runs
+            wandb.log({f"val/{k}": v for k, v in test_stats.items()}, step=0)
+            wandb.finish()
         return
 
     print("Start training")
@@ -275,7 +321,16 @@ def main(args):
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm)
         lr_scheduler.step()
+        # WandB per-epoch logging
+        if args.wandb and utils.is_main_process():
+            import wandb
+            metrics = {f"train/{k}": v for k, v in train_stats.items()}
+            for i, pg in enumerate(optimizer.param_groups):
+                metrics[f"lr/group_{i}"] = pg["lr"]
+            metrics["epoch"] = epoch
+            wandb.log(metrics, step=epoch)
         if args.output_dir:
+            os.makedirs(args.output_dir, exist_ok=True)
             checkpoint_paths = [output_dir / 'checkpoint.pth']
             # extra checkpoint before LR drop and every 5 epochs
             if (epoch + 1) % args.lr_drop == 0 or (epoch + 1) % 5 == 0:
@@ -288,11 +343,24 @@ def main(args):
                     'epoch': epoch,
                     'args': args,
                 }, checkpoint_path)
-
+                # upload symlinks/ckpts to wandb
+                if args.wandb and utils.is_main_process():
+                    import wandb
+                    wandb.save(str(checkpoint_path), base_path=str(output_dir))
+        
         test_stats, coco_evaluator = evaluate(
             model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
         )
-
+        # wandb validation metrics
+        if args.wandb and utils.is_main_process():
+            import wandb
+            # (re)build the dict to avoid scope surprises
+            all_metrics = {f"train/{k}": v for k, v in train_stats.items()}
+            all_metrics.update({f"val/{k}": v for k, v in test_stats.items()})
+            for i, pg in enumerate(optimizer.param_groups):
+                all_metrics[f"lr/group_{i}"] = pg["lr"]
+            all_metrics["epoch"] = epoch
+            wandb.log(all_metrics, step=epoch)
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      **{f'test_{k}': v for k, v in test_stats.items()},
                      'epoch': epoch,
@@ -316,7 +384,9 @@ def main(args):
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
-
+    if args.wandb and utils.is_main_process():
+        import wandb
+        wandb.finish()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('Deformable DETR training and evaluation script', parents=[get_args_parser()])

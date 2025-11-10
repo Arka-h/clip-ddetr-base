@@ -51,4 +51,8 @@ python -u -m torch.distributed.run \
     --coco_path $COCO_HOME \
     --output_dir $PROJECT_HOME/outputs/open_set_ddetr_box_refine \
     --start_epoch 0 \
+    --wandb_user "aurkohaldi" \
+    --wandb_name "DDETR_ow_open" \
+    --wandb_project "ddetr" \
+    --wandb \
 # --resume $PROJECT_HOME/checkpoints/r50_deformable_detr_plus_iterative_bbox_refinement-checkpoint.pth
