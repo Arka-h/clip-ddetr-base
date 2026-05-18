@@ -35,7 +35,7 @@ def _get_clones(module, N):
 class DeformableDETR(nn.Module):
     """ This is the Deformable DETR module that performs object detection """
     def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels,
-                 aux_loss=True, with_box_refine=False, two_stage=False):
+                 aux_loss=True, with_box_refine=False, two_stage=False, clip_dim: int = 512):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -82,6 +82,7 @@ class DeformableDETR(nn.Module):
         self.aux_loss = aux_loss
         self.with_box_refine = with_box_refine
         self.two_stage = two_stage
+        self.query_clip_proj = nn.Linear(hidden_dim, clip_dim)
 
         prior_prob = 0.01
         bias_value = -math.log((1 - prior_prob) / prior_prob)
@@ -178,6 +179,8 @@ class DeformableDETR(nn.Module):
         outputs_coord = torch.stack(outputs_coords)
 
         out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+        out['query_clip_embeds'] = F.normalize(self.query_clip_proj(hs[-1]), dim=-1)
+        out['hs_last'] = hs[-1]
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
 
@@ -459,6 +462,7 @@ def build(args):
         aux_loss=args.aux_loss,
         with_box_refine=args.with_box_refine,
         two_stage=args.two_stage,
+        clip_dim=getattr(args, 'clip_dim', 512),
     )
     if args.masks:
         model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))

@@ -22,37 +22,38 @@ class data_prefetcher():
 
     def preload(self):
         try:
-            self.next_samples, self.next_targets = next(self.loader)
+            batch = next(self.loader)
+            self.next_samples, self.next_targets = batch[0], batch[1]
+            self.next_sketches = batch[2] if len(batch) > 2 else None
+            self.next_cat_embeds = batch[3] if len(batch) > 3 else None
+            self.next_cat_ids = batch[4] if len(batch) > 4 else None
         except StopIteration:
             self.next_samples = None
             self.next_targets = None
+            self.next_sketches = None
+            self.next_cat_embeds = None
+            self.next_cat_ids = None
             return
-        # if record_stream() doesn't work, another option is to make sure device inputs are created
-        # on the main stream.
-        # self.next_input_gpu = torch.empty_like(self.next_input, device='cuda')
-        # self.next_target_gpu = torch.empty_like(self.next_target, device='cuda')
-        # Need to make sure the memory allocated for next_* is not still in use by the main stream
-        # at the time we start copying to next_*:
-        # self.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.stream):
             self.next_samples, self.next_targets = to_cuda(self.next_samples, self.next_targets, self.device)
-            # more code for the alternative if record_stream() doesn't work:
-            # copy_ will record the use of the pinned source tensor in this side stream.
-            # self.next_input_gpu.copy_(self.next_input, non_blocking=True)
-            # self.next_target_gpu.copy_(self.next_target, non_blocking=True)
-            # self.next_input = self.next_input_gpu
-            # self.next_target = self.next_target_gpu
-
-            # With Amp, it isn't necessary to manually convert data to half.
-            # if args.fp16:
-            #     self.next_input = self.next_input.half()
-            # else:
+            if self.next_sketches is not None:
+                self.next_sketches = tuple(
+                    s.to(self.device, non_blocking=True) for s in self.next_sketches
+                )
+            if self.next_cat_embeds is not None:
+                self.next_cat_embeds = tuple(
+                    e.to(self.device, non_blocking=True) if isinstance(e, torch.Tensor) else e
+                    for e in self.next_cat_embeds
+                )
 
     def next(self):
         if self.prefetch:
             torch.cuda.current_stream().wait_stream(self.stream)
             samples = self.next_samples
             targets = self.next_targets
+            sketches = self.next_sketches
+            cat_embeds = self.next_cat_embeds
+            cat_ids = self.next_cat_ids
             if samples is not None:
                 samples.record_stream(torch.cuda.current_stream())
             if targets is not None:
@@ -62,9 +63,12 @@ class data_prefetcher():
             self.preload()
         else:
             try:
-                samples, targets = next(self.loader)
+                batch = next(self.loader)
+                samples, targets = batch[0], batch[1]
+                sketches = batch[2] if len(batch) > 2 else None
+                cat_embeds = batch[3] if len(batch) > 3 else None
+                cat_ids = batch[4] if len(batch) > 4 else None
                 samples, targets = to_cuda(samples, targets, self.device)
             except StopIteration:
-                samples = None
-                targets = None
-        return samples, targets
+                samples = targets = sketches = cat_embeds = cat_ids = None
+        return samples, targets, sketches, cat_embeds, cat_ids

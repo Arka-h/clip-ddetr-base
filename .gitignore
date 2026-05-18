@@ -1,7 +1,9 @@
 .env
+.claude/
 annotations/
 checkpoints/
 outputs/
 __pycache__/
 models/ops/build/
+wandb/
 *.ipynb
