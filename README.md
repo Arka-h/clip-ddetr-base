@@ -54,13 +54,13 @@ Both scripts accept `WORLD` as the third positional argument.
 
 ## Step 1 — Train the projection layer
 
-Freezes all def-DETR weights and trains only `query_clip_proj` (256 → 512, ~131 K params) using pre-computed CLIP text embeddings as alignment targets.
+Freezes all def-DETR weights and trains only `query_clip_proj` (256 → 512, ~131 K params).
 
 Each script carries its own `#SBATCH` headers so it runs identically whether invoked locally or submitted to Slurm:
 
 ```bash
-bash  scripts/train_proj.sh [RESUME] [SKETCH_DS] [WORLD]   # local GPU
-sbatch scripts/train_proj.sh                                # Slurm (uses #SBATCH defaults)
+bash  scripts/train_proj.sh [RESUME] [SKETCH_DS] [WORLD] [VARIANT]   # local GPU
+sbatch scripts/train_proj.sh                                           # Slurm
 ```
 
 | Positional arg | Default | Options |
@@ -68,43 +68,78 @@ sbatch scripts/train_proj.sh                                # Slurm (uses #SBATC
 | `RESUME` | `checkpoints/r50_deformable_detr_plus_iterative_bbox_refinement-checkpoint.pth` | any def-DETR `.pth` |
 | `SKETCH_DS` | `qd` | `qd` (QuickDraw), `sk` (Sketchy) |
 | `WORLD` | `open` | `open`, `closed` |
+| `VARIANT` | `v1` | `v1`, `sketch`, `contrast`, `both` — see table below |
+
+### Training variants
+
+| `VARIANT` | Training target | Loss | W&B run name | Notes |
+|---|---|---|---|---|
+| `v1` | CLIP text embedding | cosine | `base_qd_ow_v1` | Baseline. Reuses `features_cache.pt`. |
+| `sketch` | CLIP **sketch** embedding | cosine | `v2_sketch_qd_ow` | Closes train/eval domain gap. Builds `features_cache_v2.pt` once by augmenting the v1 cache with CLIP visual encodings of sketches (cheap — detector not re-run). |
+| `contrast` | CLIP text embedding | **InfoNCE** | `v2_contrast_qd_ow` | In-batch contrastive: matched queries rank above all others. Reuses v1 cache directly. |
+| `both` | CLIP **sketch** embedding | **InfoNCE** | `v2_both_qd_ow` | Combines both improvements. Highest expected gain. |
+
+W&B run names substitute `qd` with `sk` when `SKETCH_DS=sk`.
 
 **Examples**
 
 ```bash
-# Open-world QuickDraw — local GPU
+# v1 baseline (open-world, QuickDraw)
 bash scripts/train_proj.sh
 
-# Same, submitted to Slurm
-sbatch scripts/train_proj.sh
+# v2 — sketch targets only
+bash scripts/train_proj.sh "" qd open sketch
+
+# v2 — InfoNCE contrastive loss only (reuses existing features_cache.pt)
+bash scripts/train_proj.sh "" qd open contrast
+
+# v2 — both (recommended for best performance)
+bash scripts/train_proj.sh "" qd open both
+
+# Slurm — submit any variant
+sbatch scripts/train_proj.sh "" qd open both
 
 # Closed-world upper-bound
-bash scripts/train_proj.sh checkpoints/r50_deformable_detr_plus_iterative_bbox_refinement-checkpoint.pth qd closed
+bash scripts/train_proj.sh "" qd closed v1
 
-# Sketchy, open-world
-bash scripts/train_proj.sh checkpoints/r50_deformable_detr_plus_iterative_bbox_refinement-checkpoint.pth sk open
-
-# Pass extra Python flags after the three positional args
-bash scripts/train_proj.sh checkpoints/....pth qd open --epochs 20 --lr 5e-4
+# Extra Python flags (append after VARIANT)
+bash scripts/train_proj.sh "" qd open both --epochs 20 --lr 5e-4
 ```
 
-Checkpoints are saved to `outputs/clip_proj_aligned_{WORLD}_{SKETCH_DS}/` after every epoch:
+### Cache reuse
+
+On the first run, the frozen def-DETR pass extracts matched decoder query features once and saves them to `features_cache.pt` (~10–20× speedup for all subsequent epochs). v2 variants build on this:
 
 ```
-outputs/clip_proj_aligned_open_qd/
-├── checkpoint.pth        # latest epoch (overwritten each epoch)
+features_cache.pt    ← extracted once (full def-DETR forward, slow)
+features_cache_v2.pt ← augmented from v1 (CLIP visual pass only, fast)
+                        built automatically when VARIANT=sketch or both
+```
+
+Both variants point `--base_cache_dir` at the v1 output directory so they reuse the existing `features_cache.pt` without re-running the detector.
+
+Checkpoints are saved after every epoch:
+
+```
+outputs/clip_proj_aligned_open_qd/          # v1
+outputs/clip_proj_aligned_open_qd_sketch/   # sketch variant
+outputs/clip_proj_aligned_open_qd_contrast/ # contrast variant
+outputs/clip_proj_aligned_open_qd_both/     # both
+├── checkpoint.pth          # latest epoch
+├── checkpoint_best.pth     # best epoch by val loss
 ├── checkpoint0000.pth
-├── checkpoint0001.pth
 └── ...
 ```
 
-Key Python flags (pass after the three positional args):
+Key Python flags (pass after `VARIANT`):
 
 | Flag | Default | Description |
 |---|---|---|
 | `--epochs` | `10` | Number of training epochs |
 | `--lr` | `1e-3` | Adam learning rate |
 | `--batch_size` | `4` | Batch size |
+| `--temperature` | `0.07` | InfoNCE softmax temperature (`contrast` / `both` only) |
+| `--sketch_embed_k` | `5` | Sketches averaged per category in v2 cache |
 | `--debug_size` | `0` | Truncate dataset to N samples (0 = full) |
 
 ---
@@ -182,24 +217,48 @@ Key flags (pass after positional args to override defaults):
 | `--batch_size` | `1` | Inference batch size |
 | `--clip_checkpoint` | `checkpoints/clip_model/ViT-B-32.pt` | CLIP model path |
 | `--output_dir` | `outputs/eval_baseline` | Output directory |
+| `--random_proj` | off | Reinitialise `query_clip_proj` with random weights after loading the checkpoint — use as a chance-level sanity check |
+
+**Random projection baseline**
+
+Measures what recall/mAP looks like with a randomly initialised projection (scores are meaningless cosine similarities). Any trained checkpoint can be used since only the def-DETR backbone weights are kept.
+
+```bash
+bash scripts/eval_baseline.sh outputs/clip_proj_aligned_open_qd/checkpoint.pth qd open --random_proj
+```
 
 ---
 
 ## Quick end-to-end run
 
 ```bash
-# Rigorous baseline (open-world, QuickDraw) — local GPU
-bash scripts/train_proj.sh     # → outputs/clip_proj_aligned_open_qd/
-bash scripts/eval_baseline.sh
+# ── v1 baseline (open-world, QuickDraw) ──────────────────────────────────────
+bash scripts/train_proj.sh              # trains + auto-evals
+bash scripts/eval_baseline.sh          # standalone eval
 
-# Same, on Slurm (no changes needed — #SBATCH headers are built into the scripts)
+# Slurm (no changes needed — #SBATCH headers built into scripts)
 sbatch scripts/train_proj.sh
 sbatch scripts/eval_baseline.sh
 
-# Upper-bound comparison (closed-world, same dataset)
-bash  scripts/train_proj.sh checkpoints/r50_deformable_detr_plus_iterative_bbox_refinement-checkpoint.pth qd closed
-bash  scripts/eval_baseline.sh outputs/clip_proj_aligned_closed_qd/checkpoint.pth qd closed
+# ── v2 — full (sketch targets + InfoNCE) ─────────────────────────────────────
+# Requires v1 to have run first so features_cache.pt exists
+bash scripts/train_proj.sh "" qd open both
+
+# ── Upper-bound comparison (closed-world) ─────────────────────────────────────
+bash scripts/train_proj.sh "" qd closed v1
+bash scripts/eval_baseline.sh outputs/clip_proj_aligned_closed_qd/checkpoint.pth qd closed
 ```
+
+### Baseline results (open-world, QuickDraw, 2111 val samples)
+
+| Variant | Recall@1 | Recall@5 | Recall@10 | mAP | AP@50 | AR@100 |
+|---|---|---|---|---|---|---|
+| v1 (text targets, cosine) | 8.5% | 23.2% | 32.3% | 1.35% | 2.28% | 47.8% |
+| sketch | — | — | — | — | — | — |
+| contrast | — | — | — | — | — | — |
+| both | — | — | — | — | — | — |
+
+*AR@100 = 47.8% means the detector proposals cover GT boxes well; the gap to AR@10 shows ranking quality is the bottleneck.*
 
 ### Citing Deformable DETR
 If you find Deformable DETR useful in your research, please consider citing:

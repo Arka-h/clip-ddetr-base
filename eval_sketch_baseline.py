@@ -97,6 +97,9 @@ def get_args_parser():
 
     # CLIP
     p.add_argument('--clip_checkpoint', default='checkpoints/clip_model/ViT-B-32.pt')
+    p.add_argument('--random_proj', action='store_true',
+                   help='Reinitialise query_clip_proj with random weights after loading '
+                        'the checkpoint. Use as a chance-level sanity check.')
 
     # Evaluation
     p.add_argument('--topk', nargs='+', type=int, default=[1, 5, 10])
@@ -161,6 +164,10 @@ def main():
     checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
     missing, unexpected = model.load_state_dict(checkpoint['model'], strict=False)
     print(f"Loaded checkpoint. Missing: {missing}  Unexpected: {unexpected}")
+
+    if args.random_proj:
+        model.query_clip_proj.reset_parameters()
+        print("query_clip_proj reinitialised with random weights (chance-level baseline)")
 
     # ── CLIP ─────────────────────────────────────────────────────────────────
     print(f"Loading CLIP from {args.clip_checkpoint} ...")

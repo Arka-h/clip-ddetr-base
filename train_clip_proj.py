@@ -4,29 +4,44 @@ Alignment training for the query_clip_proj layer only.
 Freezes the entire def-DETR model and trains only the 256->512 linear projection
 that maps decoder query features to CLIP's embedding space.
 
-Training signal: cosine similarity between projected matched-query features and
-the pre-computed CLIP text embedding for the GT category.
+Training signal (v1 default):
+  Cosine similarity between projected matched-query features and the
+  pre-computed CLIP text embedding for the GT category.
+
+v2 flags (can be combined):
+  --sketch_targets    Use CLIP sketch embeddings as training targets instead
+                      of text embeddings (closes train/eval domain gap).
+                      Builds features_cache_v2.pt on first run by augmenting
+                      the existing features_cache.pt with CLIP sketch embeds.
+  --contrastive_loss  Replace per-sample cosine loss with in-batch InfoNCE:
+                      matched queries should rank highest for their own target.
 
 Speed mode (--cache_features, recommended):
   On the first run the frozen def-DETR forward pass is executed once per sample
-  and hs_last [300, 256] is cached to disk. All subsequent epochs skip the
-  backbone/encoder/decoder entirely (~10-20x faster per epoch). AMP is used
-  for the extraction pass.
+  and hs_matched [n_gt, 256] is cached to disk. All subsequent epochs skip the
+  backbone/encoder/decoder entirely (~10-20x faster per epoch).
 
 Usage:
-    python train_clip_proj.py \
-        --coco_path /home/rahul/coco \
-        --resume checkpoints/r50_deformable_detr.pth \
-        --sketch_dataset qd \
-        --sketch_root /path/to/quickdraw_npy \
-        --epochs 10 --lr 1e-3 \
-        --cache_features \
-        --output_dir outputs/clip_proj_aligned
+    # v1 (text targets, cosine loss)
+    python train_clip_proj.py --resume ckpt.pth --coco_path /coco \
+        --sketch_dataset qd --sketch_root /npy --epochs 10 --cache_features
+
+    # v2 sketch targets only
+    python train_clip_proj.py ... --sketch_targets \
+        --clip_checkpoint checkpoints/clip_model/ViT-B-32.pt
+
+    # v2 contrastive loss only (reuses v1 cache)
+    python train_clip_proj.py ... --contrastive_loss
+
+    # v2 both (highest expected gain)
+    python train_clip_proj.py ... --sketch_targets --contrastive_loss \
+        --clip_checkpoint checkpoints/clip_model/ViT-B-32.pt
 """
 
 import argparse
 import math
 import os
+import pickle
 from pathlib import Path
 
 import numpy as np
@@ -34,10 +49,11 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
+import clip
 import wandb
 
 import util.misc as utils
-from datasets.coco import CocoDetectionQD, CocoDetectionSketchy, make_coco_transforms
+from datasets.coco import CocoDetectionQD, CocoDetectionSketchy, make_coco_transforms, rasterize_stroke3
 from models import build_model
 from models.matcher import build_matcher
 
@@ -104,6 +120,168 @@ def extract_features(model, matcher, loader, device, cache_path):
     return records
 
 
+# ── v2 helpers ────────────────────────────────────────────────────────────────
+
+def load_clip_model(checkpoint_path, device):
+    """Return (clip_model, preprocess) for ViT-B/32."""
+    model, preprocess = clip.load(checkpoint_path, device=device)
+    model.eval()
+    return model, preprocess
+
+
+def _build_sketch_file_map(sketch_root):
+    """
+    Scan sketch_root for QuickDraw ptr+strokes pairs and return
+    {category_name: (ptr_path, strokes_path)}.
+    Prefers 'train' split, falls back to 'valid' then 'test'.
+    """
+    import glob
+    # Collect all ptr files; each implies a paired strokes file
+    cat_map = {}
+    for split in ('train', 'valid', 'test'):
+        for ptr_path in glob.glob(os.path.join(sketch_root, f'*.{split}.ptr.npy')):
+            stem = os.path.basename(ptr_path)[:-4]          # e.g. 'cat.train.ptr'
+            cat = stem.rsplit('.', 2)[0]                     # 'cat'
+            strokes_path = ptr_path.replace('.ptr.npy', '.strokes.npy')
+            if cat not in cat_map and os.path.exists(strokes_path):
+                cat_map[cat] = (ptr_path, strokes_path)
+    return cat_map
+
+
+@torch.no_grad()
+def _sketch_embed_for_category(cat_name, ptr_path, strokes_path, clip_model, preprocess,
+                                device, k):
+    """Sample k QuickDraw sketches using ptr+strokes format → mean normalised CLIP embed [512]."""
+    ptr     = np.load(ptr_path)
+    strokes = np.load(strokes_path, mmap_mode='r')
+    n_sketches = len(ptr) - 1
+    idx = np.random.choice(n_sketches, min(k, n_sketches), replace=False)
+    imgs = [rasterize_stroke3(strokes[ptr[i]:ptr[i + 1]]) for i in idx]
+    tensors = torch.stack([preprocess(img) for img in imgs]).to(device)
+    feats = clip_model.encode_image(tensors)
+    return F.normalize(feats.float().mean(0), dim=-1).cpu()
+
+
+def _build_nearest_sketch_map(missing_cats, available_cats, text_embeds, clip_model, device,
+                              sim_threshold=0.85):
+    """
+    For each category in missing_cats (no .npy file), find the nearest available
+    QuickDraw category by cosine similarity in CLIP text space.
+    If the best similarity is below sim_threshold, maps to None (caller falls back
+    to the CLIP text embedding for that category).
+    Returns {missing_cat: nearest_available_cat | None}.
+    """
+    tokens = clip.tokenize(available_cats).to(device)
+    with torch.no_grad():
+        avail_vecs = F.normalize(clip_model.encode_text(tokens).float(), dim=-1)  # [N_avail, 512]
+
+    nearest_map = {}
+    print(f"  Resolving {len(missing_cats)} missing categories "
+          f"(sim_threshold={sim_threshold}):")
+    for cat in sorted(missing_cats):
+        cat_vec = F.normalize(
+            torch.as_tensor(text_embeds[cat], dtype=torch.float32).flatten().to(device), dim=0
+        )
+        sims = avail_vecs @ cat_vec                     # [N_avail]
+        best_sim, best_idx = sims.max(0)
+        best_sim = best_sim.item()
+
+        if best_sim >= sim_threshold:
+            nearest = available_cats[best_idx.item()]
+            nearest_map[cat] = nearest
+            print(f"    '{cat}' → '{nearest}'  (sim={best_sim:.3f})")
+        else:
+            nearest_map[cat] = None                     # fallback: use text embed
+            print(f"    '{cat}' → [text embed]  (best sim={best_sim:.3f} < {sim_threshold})")
+    return nearest_map
+
+
+@torch.no_grad()
+def augment_cache_with_sketches(records, clip_model, preprocess,
+                                sketch_root, text_embeds_pkl,
+                                device, out_path, k=5, sim_threshold=0.85):
+    """
+    Build features_cache_v2.pt by adding a 'sketch_embed' [512] field to every
+    existing record.  Category is recovered via cosine reverse-lookup against
+    text_embeddings.pkl so the expensive hs_matched extraction is not repeated.
+    """
+    with open(text_embeds_pkl, 'rb') as f:
+        text_embeds = pickle.load(f)
+
+    cat_names = list(text_embeds.keys())
+    # Flatten each embed to [D] before stacking — guards against [1, D] entries in the pkl
+    cat_vecs = F.normalize(
+        torch.stack([torch.as_tensor(text_embeds[c], dtype=torch.float32).flatten()
+                     for c in cat_names]),
+        dim=-1,
+    )  # [N_cats, D]  guaranteed 2D
+
+    # Build canonical category → file path map (handles split/format suffixes)
+    cat_file_map = _build_sketch_file_map(sketch_root)
+    available_set = set(cat_file_map.keys())
+
+    missing_cats = {c for c in cat_names if c not in available_set}
+    nearest_map: dict = {}   # missing_cat → nearest available cat name | None
+    if missing_cats:
+        nearest_map = _build_nearest_sketch_map(
+            missing_cats, sorted(available_set), text_embeds, clip_model, device,
+            sim_threshold=sim_threshold)
+
+    per_cat: dict = {}   # cat_name → sketch_embed tensor [512]
+    augmented = []
+    n = len(records)
+    print(f"Augmenting {n} records | {len(available_set)} cats available, "
+          f"{len(missing_cats)} truly missing …")
+
+    for i, rec in enumerate(records):
+        cat_flat = F.normalize(rec['cat_embed'].float().flatten(), dim=0)  # [D]
+        cat_name = cat_names[(cat_vecs @ cat_flat).argmax().item()]
+        effective_cat = nearest_map.get(cat_name, cat_name)  # None = below threshold
+
+        if effective_cat is None:
+            # Truly missing and no close proxy — use normalised text embed
+            sketch_embed = F.normalize(rec['cat_embed'].float().flatten(), dim=0).cpu()
+        else:
+            if effective_cat not in per_cat:
+                ptr_path, strokes_path = cat_file_map[effective_cat]
+                per_cat[effective_cat] = _sketch_embed_for_category(
+                    effective_cat, ptr_path, strokes_path,
+                    clip_model, preprocess, device, k,
+                )
+            sketch_embed = per_cat[effective_cat]
+
+        augmented.append({
+            'hs_matched':   rec['hs_matched'],
+            'cat_embed':    rec['cat_embed'],
+            'sketch_embed': sketch_embed,
+        })
+
+        if (i + 1) % 5000 == 0 or (i + 1) == n:
+            print(f"  [{i + 1}/{n}]  {len(per_cat)} categories resolved")
+
+    torch.save(augmented, out_path)
+    print(f"Saved v2 cache ({len(augmented)} records, {len(per_cat)} cats) → {out_path}")
+    return augmented
+
+
+def infonce_loss_fn(projs_list, targets_stacked, temperature):
+    """
+    In-batch InfoNCE: each matched query should rank highest for its own target.
+
+    projs_list:      list of N tensors, each [n_i, 512] L2-normalised
+    targets_stacked: [N, 512] L2-normalised (one target per record)
+
+    Returns un-normalised sum loss (caller divides by N for logging parity).
+    """
+    loss = torch.tensor(0.0, device=targets_stacked.device)
+    for i, proj in enumerate(projs_list):
+        logits = (proj @ targets_stacked.mT) / temperature   # [n_i, N]
+        labels = torch.full((len(proj),), i,
+                            dtype=torch.long, device=targets_stacked.device)
+        loss = loss + F.cross_entropy(logits, labels)
+    return loss
+
+
 # ── Argument parsing ───────────────────────────────────────────────────────────
 
 def get_args_parser():
@@ -130,6 +308,33 @@ def get_args_parser():
                    help='Pre-extract hs_last once and cache to disk. '
                         'Skips the backbone/encoder/decoder on all subsequent epochs '
                         '(~10-20x faster). Uses fixed val-style transforms for extraction.')
+    p.add_argument('--base_cache_dir', default='',
+                   help='Directory that already contains features_cache.pt from a v1 run. '
+                        'Used by v2 variants to reuse the expensive detector extraction.')
+
+    # v2: sketch targets
+    p.add_argument('--sketch_targets', action='store_true', default=False,
+                   help='Use CLIP sketch embeddings as training targets instead of text '
+                        'embeddings. Requires --clip_checkpoint. Builds '
+                        'features_cache_v2.pt on first run (reuses hs_matched from v1 cache).')
+    p.add_argument('--clip_checkpoint', default='',
+                   help='Path to CLIP ViT-B/32 .pt file. Required for --sketch_targets.')
+    p.add_argument('--text_embeds', default='',
+                   help='Path to text_embeddings.pkl for category reverse-lookup when '
+                        'building v2 cache. Defaults to <clip_checkpoint_dir>/text_embeddings.pkl.')
+    p.add_argument('--sketch_embed_k', default=5, type=int,
+                   help='Number of sketches to average per category in v2 cache.')
+    p.add_argument('--sketch_map_threshold', default=0.85, type=float,
+                   help='Min cosine similarity (CLIP text space) to accept a nearest-neighbour '
+                        'QuickDraw substitute for a missing category. '
+                        'Below this threshold the CLIP text embedding is used instead.')
+
+    # v2: contrastive loss
+    p.add_argument('--contrastive_loss', action='store_true', default=False,
+                   help='Replace per-sample cosine loss with in-batch InfoNCE. '
+                        'Matched queries must rank above all other queries in the batch.')
+    p.add_argument('--temperature', default=0.07, type=float,
+                   help='Softmax temperature for InfoNCE loss.')
 
     # Training
     p.add_argument('--epochs', default=10, type=int)
@@ -254,23 +459,52 @@ def main():
 
     # ── Feature caching ────────────────────────────────────────────────────────
     if args.cache_features:
-        cache_path = os.path.join(args.output_dir, 'features_cache.pt')
+        # ── v1 cache (hs_matched + cat_embed) ─────────────────────────────────
+        base_dir = args.base_cache_dir or args.output_dir
+        v1_cache = os.path.join(base_dir, 'features_cache.pt')
+        v2_cache = os.path.join(args.output_dir, 'features_cache_v2.pt')
 
-        if os.path.exists(cache_path):
-            print(f"Loading cached features from {cache_path}")
-            records = torch.load(cache_path, weights_only=False)
+        # Determine which cache file we actually need
+        need_v2_cache = args.sketch_targets
+        active_cache = v2_cache if need_v2_cache else v1_cache
+
+        if os.path.exists(active_cache):
+            print(f"Loading cache from {active_cache}")
+            records = torch.load(active_cache, weights_only=False)
         else:
-            # Extract once with fixed transforms + AMP
-            extract_ds = build_dataset(extract_transforms)
-            extract_loader = DataLoader(
-                extract_ds,
-                batch_size=args.batch_size * 2,  # larger batch fine, no grad storage
-                shuffle=False,
-                num_workers=args.num_workers,
-                collate_fn=utils.collate_fn,
-                pin_memory=True,
-            )
-            records = extract_features(model, matcher, extract_loader, device, cache_path)
+            # Ensure v1 cache exists (extract if missing)
+            if os.path.exists(v1_cache):
+                print(f"Loading v1 cache from {v1_cache}")
+                records = torch.load(v1_cache, weights_only=False)
+            else:
+                extract_ds = build_dataset(extract_transforms)
+                extract_loader = DataLoader(
+                    extract_ds,
+                    batch_size=args.batch_size * 2,
+                    shuffle=False,
+                    num_workers=args.num_workers,
+                    collate_fn=utils.collate_fn,
+                    pin_memory=True,
+                )
+                records = extract_features(model, matcher, extract_loader, device, v1_cache)
+
+            if need_v2_cache:
+                # Augment v1 records with CLIP sketch embeddings
+                assert args.clip_checkpoint, "--clip_checkpoint is required for --sketch_targets"
+                assert args.sketch_root,     "--sketch_root is required for --sketch_targets"
+                text_embeds_pkl = args.text_embeds or os.path.join(
+                    os.path.dirname(args.clip_checkpoint), 'text_embeddings.pkl')
+
+                print(f"Loading CLIP for sketch augmentation from {args.clip_checkpoint} …")
+                clip_model_aug, preprocess_aug = load_clip_model(args.clip_checkpoint, device)
+                records = augment_cache_with_sketches(
+                    records, clip_model_aug, preprocess_aug,
+                    args.sketch_root, text_embeds_pkl,
+                    device, v2_cache, k=args.sketch_embed_k,
+                    sim_threshold=args.sketch_map_threshold,
+                )
+                del clip_model_aug, preprocess_aug
+                torch.cuda.empty_cache()
 
         train_loader = DataLoader(
             CachedFeatureDataset(records),
@@ -280,7 +514,11 @@ def main():
             collate_fn=cache_collate,
         )
         use_cache = True
-        print(f"Cache mode: {len(records)} records | batch size: {args.batch_size * 4}")
+        variant_tag = []
+        if args.sketch_targets:   variant_tag.append('sketch-targets')
+        if args.contrastive_loss: variant_tag.append('InfoNCE')
+        vtag = '+'.join(variant_tag) or 'text-targets+cosine'
+        print(f"Cache mode [{vtag}]: {len(records)} records | batch {args.batch_size * 4}")
 
     else:
         # Standard mode: run full model every step
@@ -312,15 +550,39 @@ def main():
         for batch in train_loader:
 
             if use_cache:
-                # batch is a list of record dicts — skip the model forward entirely
-                loss = torch.tensor(0.0, device=device)
-                n_matched = 0
-                for rec in batch:
-                    hs_matched = rec['hs_matched'].to(device)          # [n_gt, 256]
-                    proj = F.normalize(model.query_clip_proj(hs_matched), dim=-1)
-                    text_tgt = F.normalize(rec['cat_embed'].float().to(device).unsqueeze(0), dim=-1)
-                    loss = loss + (1.0 - (proj * text_tgt).sum(-1)).mean()
-                    n_matched += 1
+                # ── select target key ──────────────────────────────────────────
+                tgt_key = 'sketch_embed' if args.sketch_targets else 'cat_embed'
+
+                if args.contrastive_loss:
+                    # In-batch InfoNCE: gather all projs + targets then compute once
+                    projs_list = []
+                    targets_list = []
+                    for rec in batch:
+                        proj = F.normalize(
+                            model.query_clip_proj(rec['hs_matched'].to(device)), dim=-1)
+                        # flatten to [512] regardless of whether stored as [512] or [1,512]
+                        tgt = F.normalize(rec[tgt_key].float().to(device).flatten(), dim=0)
+                        projs_list.append(proj)
+                        targets_list.append(tgt)
+
+                    n_matched = len(projs_list)
+                    if n_matched < 2:
+                        continue  # need ≥2 records for meaningful contrastive negatives
+
+                    targets_stacked = torch.stack(targets_list)          # [N, 512]
+                    loss = infonce_loss_fn(projs_list, targets_stacked, args.temperature)
+
+                else:
+                    # Per-sample cosine loss (v1 or sketch-targets only)
+                    loss = torch.tensor(0.0, device=device)
+                    n_matched = 0
+                    for rec in batch:
+                        hs_matched = rec['hs_matched'].to(device)        # [n_gt, 256]
+                        proj = F.normalize(model.query_clip_proj(hs_matched), dim=-1)
+                        tgt = F.normalize(
+                            rec[tgt_key].float().to(device).flatten(), dim=0).unsqueeze(0)
+                        loss = loss + (1.0 - (proj * tgt).sum(-1)).mean()
+                        n_matched += 1
 
             else:
                 samples, targets, _sketches, cat_embeds, _cat_ids = batch
