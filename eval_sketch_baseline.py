@@ -100,6 +100,12 @@ def get_args_parser():
     p.add_argument('--random_proj', action='store_true',
                    help='Reinitialise query_clip_proj with random weights after loading '
                         'the checkpoint. Use as a chance-level sanity check.')
+    p.add_argument('--film_conditioning', action='store_true',
+                   help='Enable FiLM global modulation (requires a checkpoint trained '
+                        'with train_film.py). Encodes each sketch to a 768-d ViT pool '
+                        'and applies γ/β to all decoder layers before scoring.')
+    p.add_argument('--film_clip_dim', default=768, type=int,
+                   help='ViT hidden dim used for FiLM (768 for ViT-B/32)')
 
     # Evaluation
     p.add_argument('--topk', nargs='+', type=int, default=[1, 5, 10])
@@ -162,7 +168,11 @@ def main():
     model.eval()
 
     checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
-    missing, unexpected = model.load_state_dict(checkpoint['model'], strict=False)
+    # class_embed is unused at eval (cosine ranking bypasses it entirely).
+    # Strip it so num_classes mismatches between checkpoint and build() never error.
+    state_dict = {k: v for k, v in checkpoint['model'].items()
+                  if not k.startswith('class_embed')}
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
     print(f"Loaded checkpoint. Missing: {missing}  Unexpected: {unexpected}")
 
     if args.random_proj:
@@ -172,6 +182,11 @@ def main():
     # ── CLIP ─────────────────────────────────────────────────────────────────
     print(f"Loading CLIP from {args.clip_checkpoint} ...")
     clip_model = load_clip_visual_encoder(args.clip_checkpoint, device)
+
+    # FiLM: import pool extractor (reuses train_film helper)
+    if args.film_conditioning:
+        from train_film import extract_vit_pool as _extract_vit_pool
+        print("FiLM conditioning active — sketch pool will be passed to decoder")
 
     # ── Dataset ──────────────────────────────────────────────────────────────
     root = Path(args.coco_path)
@@ -225,7 +240,14 @@ def main():
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
             # sketch_list_batch: tuple of [K, 3, 224, 224] tensors (one per image in batch)
 
-            outputs = model(samples)
+            # FiLM: build sketch_pool [B, film_clip_dim] from the first sketch per image
+            sketch_pool = None
+            if args.film_conditioning:
+                pools = [_extract_vit_pool(clip_model, sk[:1].to(device))
+                         for sk in sketch_list_batch]   # each [1, 768]
+                sketch_pool = torch.cat(pools, dim=0)  # [B, 768]
+
+            outputs = model(samples, sketch_pool=sketch_pool)
             query_clip_embeds = outputs['query_clip_embeds']   # [B, 300, 512]
             pred_boxes_norm = outputs['pred_boxes']             # [B, 300, 4] cxcywh norm
 

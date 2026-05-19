@@ -81,6 +81,27 @@ sbatch scripts/train_proj.sh                                           # Slurm
 
 W&B run names substitute `qd` with `sk` when `SKETCH_DS=sk`.
 
+### Matching signal
+
+The Hungarian matcher uses a cost matrix of three terms: classification cost, L1 box cost, and GIoU cost. By default, the classification cost uses the model's 91-class sigmoid predictions — but the dataloader forces all GT labels to `1` (class-agnostic), leaving 90 dead output neurons and giving the matcher a noisy signal.
+
+**All variants now use cosine similarity as the classification cost.** When `query_clip_embeds` and `sketch_embed` are present in the model output dict, the matcher replaces the class-1 column of `out_prob` with the cosine similarity between each projected query and the sketch/text embedding, remapped from `[-1, 1]` to `[0, 1]`. The focal-loss weighting and the rest of the cost computation are unchanged.
+
+```
+Before: cost_class = focal_loss(out_prob[:, 1], tgt_label=1)   # 91-class head, noisy
+After:  cost_class = focal_loss(cos_sim(query_proj, sketch_embed) → [0,1], tgt_label=1)
+```
+
+Effect per variant:
+
+| Variant | Matching embed used |
+|---|---|
+| `v1`, `contrast` | CLIP **text** embed for GT category |
+| `sketch`, `both` | CLIP **sketch** embed for GT category |
+| FiLM global | Same as above (text or sketch depending on `--sketch_targets`) |
+
+This makes matching, loss target, and eval scoring all driven by the same sketch/text signal. `num_classes` in `build()` is now irrelevant to matching quality.
+
 **Examples**
 
 ```bash
@@ -117,6 +138,12 @@ features_cache_v2.pt ← augmented from v1 (CLIP visual pass only, fast)
 ```
 
 Both variants point `--base_cache_dir` at the v1 output directory so they reuse the existing `features_cache.pt` without re-running the detector.
+
+> **Cache invalidation:** The feature cache stores `hs_matched` — the decoder query rows selected by the Hungarian matcher. Because the matcher now uses cosine similarity instead of class predictions, the matched rows will differ from those selected by an older cache. Delete `features_cache.pt` (and `features_cache_v2.pt` if present) before the first run after this change so the cache is rebuilt with the new matching signal:
+> ```bash
+> rm -f outputs/clip_proj_aligned_open_qd/features_cache.pt \
+>        outputs/clip_proj_aligned_open_qd_sketch/features_cache_v2.pt
+> ```
 
 Checkpoints are saved after every epoch:
 
@@ -257,8 +284,93 @@ bash scripts/eval_baseline.sh outputs/clip_proj_aligned_closed_qd/checkpoint.pth
 | sketch | — | — | — | — | — | — |
 | contrast | — | — | — | — | — | — |
 | both | — | — | — | — | — | — |
+| random projection | — | — | — | — | — | — |
+| FiLM global | — | — | — | — | — | — |
 
 *AR@100 = 47.8% means the detector proposals cover GT boxes well; the gap to AR@10 shows ranking quality is the bottleneck.*
+
+---
+
+## Step 3 — FiLM global conditioning (floor baseline)
+
+The cheapest possible sketch integration: one global `(γ, β)` signal, applied uniformly to every decoder query at every decoder layer.
+
+```
+sketch → frozen CLIP ViT-B/32 patch tokens [num_tokens, 768]
+       → mean-pool                          [768]
+       → film_mlp_gamma / film_mlp_beta     (2-layer MLP each: 768→256→256)
+       → γ [B, 256],  β [B, 256]
+
+for every decoder layer:
+    query = γ * query + β
+    query = layer(query, image_memory)
+
+→ query_clip_proj [B, 300, 512]  (scored by cosine sim with sketch embed at eval)
+```
+
+All spatial structure and hierarchical ViT information is discarded. The decoder receives one global signal: "look for things shaped like this sketch." This is the **absolute floor** for sketch-conditioned detection — any architecture that uses spatial or cross-attention information should beat it.
+
+**Trained parameters:** `film_mlp_gamma`, `film_mlp_beta`, `query_clip_proj` (~656 K total)
+**Frozen:** entire def-DETR backbone, encoder, decoder layer weights
+
+### Training
+
+```bash
+bash  scripts/train_film.sh [RESUME] [SKETCH_DS] [WORLD]   # local GPU
+sbatch scripts/train_film.sh                                # Slurm
+```
+
+| Positional arg | Default | Options |
+|---|---|---|
+| `RESUME` | `checkpoints/r50_deformable_detr_plus_iterative_bbox_refinement-checkpoint.pth` | any def-DETR `.pth` |
+| `SKETCH_DS` | `qd` | `qd` (QuickDraw), `sk` (Sketchy) |
+| `WORLD` | `open` | `open`, `closed` |
+
+**Examples**
+
+```bash
+# Open-world QuickDraw (default)
+bash scripts/train_film.sh
+
+# With AMP + more epochs
+bash scripts/train_film.sh "" qd open --amp --epochs 20
+
+# Sketch targets as loss signal
+bash scripts/train_film.sh "" qd open --sketch_targets
+```
+
+Checkpoints are saved to `outputs/film_global_open_qd/`.
+
+Key Python flags (append after `WORLD`):
+
+| Flag | Default | Description |
+|---|---|---|
+| `--epochs` | `10` | Training epochs |
+| `--lr` | `1e-3` | Adam learning rate |
+| `--batch_size` | `4` | Batch size |
+| `--amp` | off | Mixed-precision (recommended on ADA6000) |
+| `--sketch_targets` | off | Use CLIP sketch embed as loss target instead of text embed |
+| `--sketch_embed_k` | `5` | Sketches averaged per category for pool cache |
+| `--film_clip_dim` | `768` | ViT hidden dim (768 for ViT-B/32) |
+
+### Evaluation
+
+Pass `--film_conditioning` to `eval_baseline.sh` (or directly to `eval_sketch_baseline.py`):
+
+```bash
+bash scripts/eval_baseline.sh outputs/film_global_open_qd/checkpoint_best.pth qd open \
+    --film_conditioning
+
+# Random projection floor (chance-level sanity check — no training needed)
+bash scripts/eval_baseline.sh outputs/clip_proj_aligned_open_qd/checkpoint.pth qd open \
+    --random_proj
+```
+
+### Optimization notes
+
+- **Sketch pool cache**: CLIP ViT pools (768-d) are pre-computed once per QuickDraw category (~80 entries) at the start of training and reused across all epochs. CLIP never runs inside the training loop.
+- **Gradient efficiency**: backbone and encoder parameters are frozen (`requires_grad=False`); PyTorch's autograd naturally skips building computation graphs for their weights. Gradients originate at the FiLM modulation step inside the decoder.
+- **No decoder caching**: unlike `train_clip_proj.py`, decoder outputs cannot be pre-cached because they depend on the sketch via FiLM. Each batch runs a full def-DETR forward.
 
 ### Citing Deformable DETR
 If you find Deformable DETR useful in your research, please consider citing:

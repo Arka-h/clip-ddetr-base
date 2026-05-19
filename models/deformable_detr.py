@@ -35,7 +35,8 @@ def _get_clones(module, N):
 class DeformableDETR(nn.Module):
     """ This is the Deformable DETR module that performs object detection """
     def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels,
-                 aux_loss=True, with_box_refine=False, two_stage=False, clip_dim: int = 512):
+                 aux_loss=True, with_box_refine=False, two_stage=False, clip_dim: int = 512,
+                 film_conditioning: bool = False, film_clip_dim: int = 768):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -84,6 +85,11 @@ class DeformableDETR(nn.Module):
         self.two_stage = two_stage
         self.query_clip_proj = nn.Linear(hidden_dim, clip_dim)
 
+        self.film_conditioning = film_conditioning
+        if film_conditioning:
+            self.film_mlp_gamma = MLP(film_clip_dim, hidden_dim, hidden_dim, 2)
+            self.film_mlp_beta  = MLP(film_clip_dim, hidden_dim, hidden_dim, 2)
+
         prior_prob = 0.01
         bias_value = -math.log((1 - prior_prob) / prior_prob)
         self.class_embed.bias.data = torch.ones(num_classes) * bias_value
@@ -112,7 +118,7 @@ class DeformableDETR(nn.Module):
             for box_embed in self.bbox_embed:
                 nn.init.constant_(box_embed.layers[-1].bias.data[2:], 0.0)
 
-    def forward(self, samples: NestedTensor):
+    def forward(self, samples: NestedTensor, sketch_pool=None):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
                - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
@@ -155,7 +161,14 @@ class DeformableDETR(nn.Module):
         query_embeds = None
         if not self.two_stage:
             query_embeds = self.query_embed.weight
-        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = self.transformer(srcs, masks, pos, query_embeds)
+
+        film_gamma = film_beta = None
+        if self.film_conditioning and sketch_pool is not None:
+            film_gamma = self.film_mlp_gamma(sketch_pool.float())   # [B, hidden_dim]
+            film_beta  = self.film_mlp_beta(sketch_pool.float())    # [B, hidden_dim]
+
+        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = \
+            self.transformer(srcs, masks, pos, query_embeds, film_gamma=film_gamma, film_beta=film_beta)
 
         outputs_classes = []
         outputs_coords = []
@@ -453,6 +466,7 @@ def build(args):
     backbone = build_backbone(args)
 
     transformer = build_deforamble_transformer(args)
+    num_classes = 2 # Force the model to give binary output: 1 for foreground, 0 for background
     model = DeformableDETR(
         backbone,
         transformer,
@@ -463,6 +477,8 @@ def build(args):
         with_box_refine=args.with_box_refine,
         two_stage=args.two_stage,
         clip_dim=getattr(args, 'clip_dim', 512),
+        film_conditioning=getattr(args, 'film_conditioning', False),
+        film_clip_dim=getattr(args, 'film_clip_dim', 768),
     )
     if args.masks:
         model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))

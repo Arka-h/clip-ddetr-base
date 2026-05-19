@@ -99,6 +99,11 @@ def extract_features(model, matcher, loader, device, cache_path):
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
         outputs = model(samples)
+        outputs['sketch_embed'] = torch.stack([
+            e.float().flatten().to(device) if isinstance(e, torch.Tensor)
+            else torch.zeros(outputs['query_clip_embeds'].shape[-1], device=device)
+            for e in cat_embeds
+        ])
         indices = matcher(outputs, targets)
 
         hs_last = outputs['hs_last']  # [B, 300, 256] — on GPU, slice before moving to CPU
@@ -414,7 +419,9 @@ def main():
     model.to(device)
 
     checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
-    missing, unexpected = model.load_state_dict(checkpoint['model'], strict=False)
+    state_dict = {k: v for k, v in checkpoint['model'].items()
+                  if not k.startswith('class_embed')}
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
     print(f"Loaded checkpoint. Missing keys: {missing}")
     print(f"Unexpected keys: {unexpected}")
 
@@ -595,6 +602,11 @@ def main():
 
                 with torch.no_grad():
                     outputs = model(samples)
+                    outputs['sketch_embed'] = torch.stack([
+                        e.float().flatten() if isinstance(e, torch.Tensor)
+                        else torch.zeros(outputs['query_clip_embeds'].shape[-1], device=device)
+                        for e in cat_embeds
+                    ])
                     indices = matcher(outputs, targets)
 
                 hs_last = outputs['hs_last']

@@ -11,6 +11,7 @@
 Modules to compute the matching cost and solve the corresponding LSAP.
 """
 import torch
+import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 from torch import nn
 
@@ -72,6 +73,19 @@ class HungarianMatcher(nn.Module):
             # Also concat the target labels and boxes
             tgt_ids = torch.cat([v["labels"] for v in targets])
             tgt_bbox = torch.cat([v["boxes"] for v in targets])
+
+            # Cosine-similarity matching: replace the classification score at the target
+            # class index with cosine similarity between projected query and sketch embed.
+            # query_clip_embeds is already L2-normalised; sketch_embed is normalised here.
+            # tgt_ids are all 1 (class-agnostic labels forced by the dataloader), so the
+            # matcher only ever reads column 1 of out_prob — that is the column we overwrite.
+            if "sketch_embed" in outputs and "query_clip_embeds" in outputs:
+                query_emb = outputs["query_clip_embeds"].flatten(0, 1)          # [B*Q, 512]
+                sketch_emb = F.normalize(outputs["sketch_embed"].float(), dim=-1)  # [B, 512]
+                sketch_emb_exp = sketch_emb.unsqueeze(1).expand(-1, num_queries, -1).flatten(0, 1)
+                cos_scores = (query_emb * sketch_emb_exp).sum(-1)               # [B*Q] in [-1,1]
+                out_prob = out_prob.clone()
+                out_prob[:, tgt_ids[0]] = (cos_scores + 1) / 2                  # remap to [0,1]
 
             # Compute the classification cost.
             alpha = 0.25

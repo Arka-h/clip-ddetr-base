@@ -123,7 +123,8 @@ class DeformableTransformer(nn.Module):
         valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
         return valid_ratio
 
-    def forward(self, srcs, masks, pos_embeds, query_embed=None):
+    def forward(self, srcs, masks, pos_embeds, query_embed=None,
+                film_gamma=None, film_beta=None):
         assert self.two_stage or query_embed is not None
 
         # prepare input for encoder
@@ -178,7 +179,8 @@ class DeformableTransformer(nn.Module):
 
         # decoder
         hs, inter_references = self.decoder(tgt, reference_points, memory,
-                                            spatial_shapes, level_start_index, valid_ratios, query_embed, mask_flatten)
+                                            spatial_shapes, level_start_index, valid_ratios, query_embed, mask_flatten,
+                                            film_gamma=film_gamma, film_beta=film_beta)
 
         inter_references_out = inter_references
         if self.two_stage:
@@ -323,7 +325,7 @@ class DeformableTransformerDecoder(nn.Module):
         self.class_embed = None
 
     def forward(self, tgt, reference_points, src, src_spatial_shapes, src_level_start_index, src_valid_ratios,
-                query_pos=None, src_padding_mask=None):
+                query_pos=None, src_padding_mask=None, film_gamma=None, film_beta=None):
         output = tgt
 
         intermediate = []
@@ -336,6 +338,10 @@ class DeformableTransformerDecoder(nn.Module):
                 assert reference_points.shape[-1] == 2
                 reference_points_input = reference_points[:, :, None] * src_valid_ratios[:, None]
             output = layer(output, query_pos, reference_points_input, src, src_spatial_shapes, src_level_start_index, src_padding_mask)
+
+            # FiLM global modulation: same γ/β applied to every query at every layer
+            if film_gamma is not None:
+                output = film_gamma.unsqueeze(1) * output + film_beta.unsqueeze(1)
 
             # hack implementation for iterative bounding box refinement
             if self.bbox_embed is not None:
