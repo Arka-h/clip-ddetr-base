@@ -42,7 +42,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader
 
 import clip
@@ -236,9 +236,7 @@ def main():
     model.to(device)
 
     checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
-    state_dict = {k: v for k, v in checkpoint['model'].items()
-                  if not k.startswith('class_embed')}
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    missing, unexpected = model.load_state_dict(checkpoint['model'], strict=False)
     print(f"Loaded checkpoint. Missing: {missing}")
     print(f"Unexpected: {unexpected}")
 
@@ -252,7 +250,7 @@ def main():
 
     model.train()
     optimizer = torch.optim.Adam(proj_params, lr=args.lr)
-    scaler = GradScaler(enabled=args.amp)
+    scaler = GradScaler(enabled=False)  # MSDeformAttn doesn't support float16
     matcher = build_matcher(args)
 
     # ── CLIP ──────────────────────────────────────────────────────────────────
@@ -344,32 +342,15 @@ def main():
             sketch_pool = torch.stack(pools).to(device)    # [B, 768]
 
             # ── Forward ───────────────────────────────────────────────────────
-            with autocast(enabled=args.amp):
-                outputs = model(samples, sketch_pool=sketch_pool)
+            # AMP is intentionally disabled: MSDeformAttn custom CUDA kernel
+            # does not support float16. --amp has no effect on the model forward.
+            outputs = model(samples, sketch_pool=sketch_pool)
 
             # ── Hungarian matching (no grad needed) ───────────────────────────
-            # Build 512-d sketch embed per image for cosine matching signal.
-            # Use sketch_embed_cache (sketch targets) or cat_embeds (text targets).
             with torch.no_grad():
-                match_sketch_embs = []
-                for i in range(len(targets)):
-                    cat_id = cat_ids[i].item() if isinstance(cat_ids[i], torch.Tensor) else int(cat_ids[i])
-                    cat_name = id_to_name.get(cat_id, '').lower().replace(' ', '_')
-                    if args.sketch_targets:
-                        emb = sketch_embed_cache.get(cat_name)
-                        match_sketch_embs.append(
-                            emb if emb is not None else torch.zeros(args.clip_dim))
-                    else:
-                        ce = cat_embeds[i]
-                        match_sketch_embs.append(
-                            ce.float().flatten() if isinstance(ce, torch.Tensor)
-                            else torch.zeros(args.clip_dim))
-
                 indices = matcher(
-                    {'pred_logits':       outputs['pred_logits'].detach(),
-                     'pred_boxes':        outputs['pred_boxes'].detach(),
-                     'query_clip_embeds': outputs['query_clip_embeds'].detach(),
-                     'sketch_embed':      torch.stack(match_sketch_embs).to(device)},
+                    {'pred_logits': outputs['pred_logits'].detach(),
+                     'pred_boxes':  outputs['pred_boxes'].detach()},
                     targets_dev,
                 )
 

@@ -83,24 +83,9 @@ W&B run names substitute `qd` with `sk` when `SKETCH_DS=sk`.
 
 ### Matching signal
 
-The Hungarian matcher uses a cost matrix of three terms: classification cost, L1 box cost, and GIoU cost. By default, the classification cost uses the model's 91-class sigmoid predictions — but the dataloader forces all GT labels to `1` (class-agnostic), leaving 90 dead output neurons and giving the matcher a noisy signal.
+Hungarian matching uses the pretrained 91-class class-probability signal during **training** — the model is loaded with `num_classes=91` so the pretrained `class_embed` is intact, giving the matcher a strong signal to locate which of the 300 queries corresponds to each GT box.
 
-**All variants now use cosine similarity as the classification cost.** When `query_clip_embeds` and `sketch_embed` are present in the model output dict, the matcher replaces the class-1 column of `out_prob` with the cosine similarity between each projected query and the sketch/text embedding, remapped from `[-1, 1]` to `[0, 1]`. The focal-loss weighting and the rest of the cost computation are unchanged.
-
-```
-Before: cost_class = focal_loss(out_prob[:, 1], tgt_label=1)   # 91-class head, noisy
-After:  cost_class = focal_loss(cos_sim(query_proj, sketch_embed) → [0,1], tgt_label=1)
-```
-
-Effect per variant:
-
-| Variant | Matching embed used |
-|---|---|
-| `v1`, `contrast` | CLIP **text** embed for GT category |
-| `sketch`, `both` | CLIP **sketch** embed for GT category |
-| FiLM global | Same as above (text or sketch depending on `--sketch_targets`) |
-
-This makes matching, loss target, and eval scoring all driven by the same sketch/text signal. `num_classes` in `build()` is now irrelevant to matching quality.
+At **eval time**, proposals are ranked purely by cosine similarity between `query_clip_embeds` and the sketch embedding (see `eval_sketch_baseline.py`). The class head is never consulted at eval.
 
 **Examples**
 
@@ -138,12 +123,6 @@ features_cache_v2.pt ← augmented from v1 (CLIP visual pass only, fast)
 ```
 
 Both variants point `--base_cache_dir` at the v1 output directory so they reuse the existing `features_cache.pt` without re-running the detector.
-
-> **Cache invalidation:** The feature cache stores `hs_matched` — the decoder query rows selected by the Hungarian matcher. Because the matcher now uses cosine similarity instead of class predictions, the matched rows will differ from those selected by an older cache. Delete `features_cache.pt` (and `features_cache_v2.pt` if present) before the first run after this change so the cache is rebuilt with the new matching signal:
-> ```bash
-> rm -f outputs/clip_proj_aligned_open_qd/features_cache.pt \
->        outputs/clip_proj_aligned_open_qd_sketch/features_cache_v2.pt
-> ```
 
 Checkpoints are saved after every epoch:
 

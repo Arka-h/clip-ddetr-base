@@ -168,11 +168,7 @@ def main():
     model.eval()
 
     checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
-    # class_embed is unused at eval (cosine ranking bypasses it entirely).
-    # Strip it so num_classes mismatches between checkpoint and build() never error.
-    state_dict = {k: v for k, v in checkpoint['model'].items()
-                  if not k.startswith('class_embed')}
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    missing, unexpected = model.load_state_dict(checkpoint['model'], strict=False)
     print(f"Loaded checkpoint. Missing: {missing}  Unexpected: {unexpected}")
 
     if args.random_proj:

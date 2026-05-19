@@ -466,7 +466,6 @@ def build(args):
     backbone = build_backbone(args)
 
     transformer = build_deforamble_transformer(args)
-    num_classes = 2 # Force the model to give binary output: 1 for foreground, 0 for background
     model = DeformableDETR(
         backbone,
         transformer,
