@@ -347,10 +347,29 @@ def main():
             outputs = model(samples, sketch_pool=sketch_pool)
 
             # ── Hungarian matching (no grad needed) ───────────────────────────
+            # Use cosine-sketch signal here (not class-prob) because FiLM MLPs
+            # modify the decoder and would learn to produce bicycle-like features
+            # if class-1 (bicycle) matching were used (all GT labels are 1).
             with torch.no_grad():
+                match_sketch_embs = []
+                for i in range(len(targets)):
+                    cat_id = cat_ids[i].item() if isinstance(cat_ids[i], torch.Tensor) else int(cat_ids[i])
+                    cat_name = id_to_name.get(cat_id, '').lower().replace(' ', '_')
+                    if args.sketch_targets:
+                        emb = sketch_embed_cache.get(cat_name)
+                        match_sketch_embs.append(
+                            emb if emb is not None else torch.zeros(args.clip_dim))
+                    else:
+                        ce = cat_embeds[i]
+                        match_sketch_embs.append(
+                            ce.float().flatten() if isinstance(ce, torch.Tensor)
+                            else torch.zeros(args.clip_dim))
+
                 indices = matcher(
-                    {'pred_logits': outputs['pred_logits'].detach(),
-                     'pred_boxes':  outputs['pred_boxes'].detach()},
+                    {'pred_logits':       outputs['pred_logits'].detach(),
+                     'pred_boxes':        outputs['pred_boxes'].detach(),
+                     'query_clip_embeds': outputs['query_clip_embeds'].detach(),
+                     'sketch_embed':      torch.stack(match_sketch_embs).to(device)},
                     targets_dev,
                 )
 

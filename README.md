@@ -83,9 +83,11 @@ W&B run names substitute `qd` with `sk` when `SKETCH_DS=sk`.
 
 ### Matching signal
 
-Hungarian matching uses the pretrained 91-class class-probability signal during **training** — the model is loaded with `num_classes=91` so the pretrained `class_embed` is intact, giving the matcher a strong signal to locate which of the 300 queries corresponds to each GT box.
+**Projection training** (`train_clip_proj.py`): uses the pretrained 91-class class-probability signal. The model is loaded with `num_classes=91` so the pretrained `class_embed` is intact; bbox+giou costs dominate and reliably select the right queries. The frozen backbone and encoder are unaffected.
 
-At **eval time**, proposals are ranked purely by cosine similarity between `query_clip_embeds` and the sketch embedding (see `eval_sketch_baseline.py`). The class head is never consulted at eval.
+**FiLM training** (`train_film.py`): uses cosine-sketch matching. Class-prob matching would be harmful here because the FiLM MLPs modify decoder features — with all GT labels forced to `1` (COCO class 1 = bicycle), class-prob matching would teach FiLM to steer all decoder features toward "bicycle-like" representations, collapsing the representation at eval. Cosine-sketch matching gives FiLM the correct objective: condition decoder features so they become similar to the sketch's CLIP embedding.
+
+**Eval** (`eval_sketch_baseline.py`): proposals are ranked by cosine similarity between `query_clip_embeds` and the sketch embedding. The class head is not used.
 
 **Examples**
 
